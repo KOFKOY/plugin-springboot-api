@@ -1456,16 +1456,6 @@ function buildHttpFileHeader(baseUrl: string, tokenVarName: string, tokenValue: 
   return [
     `@baseUrl = ${baseUrl}`,
     `@${tokenVarName} = ${tokenValue || ''}`,
-    '',
-    '# TODO: 在这里补充获取 token 的请求（当前留白）',
-    '# 例如:',
-    '# POST {{baseUrl}}/auth/token',
-    '# Content-Type: application/json',
-    '#',
-    '# {',
-    '#   "username": "your-username",',
-    '#   "password": "your-password"',
-    '# }',
     ''
   ].join('\n');
 }
