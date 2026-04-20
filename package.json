@@ -2,7 +2,7 @@
   "name": "rest-client-for-springboot",
   "displayName": "SpringBoot HTTP Helper",
   "description": "Generate .http files from SpringBoot Controller mappings, with optional AI-generated test parameters.",
-  "version": "0.0.4",
+  "version": "0.0.8",
   "icon": "icon.png",
   "publisher": "tangtang-wsj",
   "engines": {
@@ -68,7 +68,7 @@
         "springHttpGenerator.ai.enabled": {
           "type": "boolean",
           "default": true,
-          "description": "是否启用 AI 生成测试参数（Responses 协议）"
+          "description": "是否启用 AI 生成测试参数（需同时配置 springHttpGenerator.ai.apiKey）"
         },
         "springHttpGenerator.ai.endpoint": {
           "type": "string",
@@ -78,7 +78,7 @@
         "springHttpGenerator.ai.apiKey": {
           "type": "string",
           "default": "",
-          "description": "OpenAI API Key"
+          "description": "OpenAI API Key（为空时默认不使用 AI 生成）"
         },
         "springHttpGenerator.ai.model": {
           "type": "string",

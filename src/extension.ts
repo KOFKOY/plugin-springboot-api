@@ -79,70 +79,76 @@ export function deactivate(): void {
 
 async function createHttpFromCurrentMapping(): Promise<void> {
   log('STEP', '开始执行 createHttpFromCurrentMapping');
-  const editor = vscode.window.activeTextEditor;
-  if (!editor) {
-    throw new Error('未找到激活中的编辑器');
+  const runningStatus = vscode.window.setStatusBarMessage('$(sync~spin) http文件生成中');
+  try {
+    const editor = vscode.window.activeTextEditor;
+    if (!editor) {
+      throw new Error('未找到激活中的编辑器');
+    }
+    log('STEP', `当前文件: ${editor.document.fileName}`);
+
+    const document = editor.document;
+    if (document.languageId !== 'java') {
+      throw new Error('当前文件不是 Java 文件');
+    }
+
+    const settings = getSettings();
+    log('STEP', `配置读取完成: baseUrl=${settings.baseUrl}, tokenVar=${settings.tokenVarName}`);
+    const allAnnotations = collectMappingAnnotations(document);
+    log('STEP', `扫描到 Mapping 注解数量: ${allAnnotations.length}`);
+    const cursorLine = editor.selection.active.line;
+    const mapping = allAnnotations.find(
+      (item) => cursorLine >= item.startLine && cursorLine <= item.endLine
+    );
+
+    if (!mapping) {
+      throw new Error('请将光标放在 Mapping 注解上再执行');
+    }
+    log('STEP', `定位到注解: ${mapping.name}, 行范围: ${mapping.startLine}-${mapping.endLine}`);
+
+    const methodSignature = parseMethodSignatureAfter(document, mapping.endLine);
+    if (!methodSignature) {
+      throw new Error('未能解析到 Mapping 注解对应的方法签名');
+    }
+    log('STEP', `解析方法签名成功: ${methodSignature.methodName}, 参数数: ${methodSignature.params.length}`);
+
+    const className = parseClassName(document) ?? path.parse(document.fileName).name;
+    const classBasePath = parseClassBasePath(document);
+    const requestInfo = parseRequestInfoFromAnnotation(mapping.rawText);
+    const requestPath = joinUrlPath(classBasePath, requestInfo.path);
+    log('STEP', `解析请求成功: method=${requestInfo.method}, path=${requestPath}, contentType=${requestInfo.contentType}`);
+
+    const prepared = await prepareRequestPayload(
+      document,
+      methodSignature.params,
+      requestPath,
+      requestInfo.method,
+      methodSignature.methodName,
+      settings
+    );
+    log('STEP', `请求参数准备完成: finalPath=${prepared.finalPath}, bodyLength=${prepared.bodyText.length}`);
+
+    const targetFilePath = await resolveTargetHttpFilePath(document, className);
+    log('STEP', `目标 HTTP 文件: ${targetFilePath}`);
+    await appendHttpRequestSection(
+      targetFilePath,
+      className,
+      methodSignature.methodName,
+      requestInfo.method,
+      prepared.finalPath,
+      requestInfo.contentType,
+      prepared.bodyText,
+      settings
+    );
+    log('STEP', 'HTTP 请求片段写入完成');
+
+    const httpDoc = await vscode.workspace.openTextDocument(targetFilePath);
+    await vscode.window.showTextDocument(httpDoc, { preview: false });
+    vscode.window.showInformationMessage(`已写入请求: ${path.basename(targetFilePath)}`);
+    vscode.window.setStatusBarMessage('$(check) http文件生成成功', 3000);
+  } finally {
+    runningStatus.dispose();
   }
-  log('STEP', `当前文件: ${editor.document.fileName}`);
-
-  const document = editor.document;
-  if (document.languageId !== 'java') {
-    throw new Error('当前文件不是 Java 文件');
-  }
-
-  const settings = getSettings();
-  log('STEP', `配置读取完成: baseUrl=${settings.baseUrl}, tokenVar=${settings.tokenVarName}`);
-  const allAnnotations = collectMappingAnnotations(document);
-  log('STEP', `扫描到 Mapping 注解数量: ${allAnnotations.length}`);
-  const cursorLine = editor.selection.active.line;
-  const mapping = allAnnotations.find(
-    (item) => cursorLine >= item.startLine && cursorLine <= item.endLine
-  );
-
-  if (!mapping) {
-    throw new Error('请将光标放在 Mapping 注解上再执行');
-  }
-  log('STEP', `定位到注解: ${mapping.name}, 行范围: ${mapping.startLine}-${mapping.endLine}`);
-
-  const methodSignature = parseMethodSignatureAfter(document, mapping.endLine);
-  if (!methodSignature) {
-    throw new Error('未能解析到 Mapping 注解对应的方法签名');
-  }
-  log('STEP', `解析方法签名成功: ${methodSignature.methodName}, 参数数: ${methodSignature.params.length}`);
-
-  const className = parseClassName(document) ?? path.parse(document.fileName).name;
-  const classBasePath = parseClassBasePath(document);
-  const requestInfo = parseRequestInfoFromAnnotation(mapping.rawText);
-  const requestPath = joinUrlPath(classBasePath, requestInfo.path);
-  log('STEP', `解析请求成功: method=${requestInfo.method}, path=${requestPath}, contentType=${requestInfo.contentType}`);
-
-  const prepared = await prepareRequestPayload(
-    document,
-    methodSignature.params,
-    requestPath,
-    requestInfo.method,
-    methodSignature.methodName,
-    settings
-  );
-  log('STEP', `请求参数准备完成: finalPath=${prepared.finalPath}, bodyLength=${prepared.bodyText.length}`);
-
-  const targetFilePath = await resolveTargetHttpFilePath(document, className);
-  log('STEP', `目标 HTTP 文件: ${targetFilePath}`);
-  await appendHttpRequestSection(
-    targetFilePath,
-    className,
-    methodSignature.methodName,
-    requestInfo.method,
-    prepared.finalPath,
-    requestInfo.contentType,
-    prepared.bodyText,
-    settings
-  );
-  log('STEP', 'HTTP 请求片段写入完成');
-
-  const httpDoc = await vscode.workspace.openTextDocument(targetFilePath);
-  await vscode.window.showTextDocument(httpDoc, { preview: false });
-  vscode.window.showInformationMessage(`已写入请求: ${path.basename(targetFilePath)}`);
 }
 
 async function resolveTargetHttpFilePath(document: vscode.TextDocument, className: string): Promise<string> {
@@ -154,19 +160,20 @@ async function resolveTargetHttpFilePath(document: vscode.TextDocument, classNam
 
 function getSettings(): ExtensionSettings {
   const config = vscode.workspace.getConfiguration('springHttpGenerator');
+  const aiApiKey = config.get<string>('ai.apiKey', '').trim();
   return {
     baseUrl: config.get<string>('baseUrl', 'http://localhost:8080').trim() || 'http://localhost:8080',
     tokenVarName: config.get<string>('tokenVarName', 'token').trim() || 'token',
     tokenValue: config.get<string>('tokenValue', '').trim(),
     autoFillTestParams: config.get<boolean>('autoFillTestParams', true),
     commonPropertyHints: config.get<Record<string, unknown>>('commonPropertyHints', {}),
-    aiEnabled: config.get<boolean>('ai.enabled', true),
+    aiEnabled: config.get<boolean>('ai.enabled', true) && Boolean(aiApiKey),
     aiEndpoint: config.get<string>('ai.endpoint', 'https://api.openai.com/v1/responses').trim(),
-    aiApiKey: config.get<string>('ai.apiKey', '').trim(),
+    aiApiKey,
     aiModel: config.get<string>('ai.model', 'gpt-5.1-codex-max').trim() || 'gpt-5.1-codex-max',
     aiContextAgentPrompt: config.get<string>(
       'ai.contextAgentPrompt',
-      '你是代码检索智能体，采用 ReAct（Reason + Act）工作流。按 Controller -> Service -> Mapper -> SQL 顺序定位上下文，只输出结构化 JSON，最终仅返回 Service 与 SQL 的有效证据，不返回 Mapper 内容本体。优先结合方法体调用、字段注入与构造注入推断 Service。'
+      '你是代码检索智能体，采用 ReAct（Reason + Act）工作流。按 Controller -> Service -> Mapper -> SQL 顺序定位上下文，只保留最关键的一条链路：最多一个 Service、最多一个 Mapper、最多一个 SQL。只输出结构化 JSON，最终仅返回 Service 与 SQL 的有效证据，不返回 Mapper 内容本体。优先结合方法体调用、字段注入与构造注入推断 Service。'
     ).trim(),
     testDataFile: config.get<string>('ai.testDataFile', '').trim(),
     projectStructureHint: config.get<string>('ai.projectStructureHint', '').trim(),
@@ -697,9 +704,14 @@ async function prepareRequestPayload(
       bodyText: JSON.stringify(localBody, null, 2)
     };
   }
-  log('STEP', `开始 AI 请求体生成: method=${methodName}, bodyParam=${bodyParam.name}`);
-  let finalBody = await tryBuildBodyWithAI(document, bodyParam, localBody, methodName, settings);
-  log('STEP', 'AI 请求体生成完成');
+  let finalBody: unknown = localBody;
+  if (settings.aiEnabled) {
+    log('STEP', `开始 AI 请求体生成: method=${methodName}, bodyParam=${bodyParam.name}`);
+    finalBody = await tryBuildBodyWithAI(document, bodyParam, localBody, methodName, settings);
+    log('STEP', 'AI 请求体生成完成');
+  } else {
+    log('STEP', '未配置 AI API Key 或 AI 已关闭，本次使用本地请求体生成');
+  }
   finalBody = enforcePlatformSiteCustomerShortNameRule(finalBody);
   log('STEP', 'AI 请求体规范化完成: 已应用 platform-site-customerShortName 关联规则');
   if (needPagination) {
@@ -1096,9 +1108,6 @@ async function tryBuildBodyWithAI(
   methodName: string,
   settings: ExtensionSettings
 ): Promise<unknown> {
-  if (!settings.aiEnabled) {
-    throw new Error('AI 参数生成已关闭。请开启配置 springHttpGenerator.ai.enabled');
-  }
   if (!settings.aiEndpoint) {
     throw new Error('未配置 OpenAI Responses 接口地址，请设置 springHttpGenerator.ai.endpoint');
   }

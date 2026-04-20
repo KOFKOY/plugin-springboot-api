@@ -4,7 +4,7 @@ import * as vscode from 'vscode';
 
 const EXCLUDE_GLOB = '**/{target,build,out,node_modules,.git,dist}/**';
 const DEFAULT_REACT_PROMPT =
-  '你是代码检索智能体，采用 ReAct（Reason + Act）范式。按 Controller -> Service -> Mapper -> SQL 顺序进行定位。必须只输出 JSON，不允许 markdown 和解释。最终目标是提取对生成接口测试参数有价值的 Service 与 SQL 证据，忽略 Mapper 样板内容。';
+  '你是代码检索智能体，采用 ReAct（Reason + Act）范式。按 Controller -> Service -> Mapper -> SQL 顺序进行定位。每一层只保留最关键的一条链路：最多 1 个 Service、最多 1 个 Mapper、最多 1 个 SQL 资源。必须只输出 JSON，不允许 markdown 和解释。最终目标是提取对生成接口测试参数有价值的 Service 与 SQL 证据，忽略 Mapper 样板内容。';
 
 type ContextLogLevel = 'INFO' | 'STEP' | 'ERROR';
 type ContextLogger = (level: ContextLogLevel, message: string) => void;
@@ -125,28 +125,38 @@ export async function collectProjectContextForPrompt(
     const controllerImports = parseImports(controllerText);
     const serviceSections: string[] = [];
     const sqlSections: string[] = [];
-    const sqlSeen = new Set<string>();
+    const primaryServiceCall = pickPrimaryServiceCall(serviceCalls);
+    if (!primaryServiceCall) {
+      logStep('Controller 阶段未选出关键 Service 调用');
+      return {
+        contextText: `[AI上下文]\nController 未选出关键 Service 调用。\n目标方法: ${methodName}`,
+        summary: '未选出关键 Service 调用'
+      };
+    }
+    if (serviceCalls.length > 1) {
+      logStep(`Controller 阶段仅保留最关键 Service: total=${serviceCalls.length}, selected=1`);
+    }
 
-    for (const serviceCall of serviceCalls) {
-      const serviceType = baseJavaTypeName(serviceCall.service_type);
-      if (!serviceType || !serviceCall.service_method) {
-        logStep(`跳过无效 Service 调用项: ${JSON.stringify(serviceCall)}`);
-        continue;
-      }
+    const serviceType = baseJavaTypeName(primaryServiceCall.service_type);
+    if (!serviceType || !primaryServiceCall.service_method) {
+      logStep(`关键 Service 调用项无效: ${JSON.stringify(primaryServiceCall)}`);
+      return {
+        contextText: `[AI上下文]\n关键 Service 调用项无效。\n目标方法: ${methodName}`,
+        summary: '关键 Service 调用项无效'
+      };
+    }
 
-      logStep(
-        `追踪 Service: var=${serviceCall.service_var}, type=${serviceType}, method=${serviceCall.service_method}`
-      );
-      const serviceImport = controllerImports[serviceType];
-      const serviceInterface = await findJavaTypeFile(serviceType, document, serviceImport, 120);
-      const serviceImpl = await findServiceImplFile(serviceType, serviceImport, document, 240);
-      const serviceFile = serviceImpl || serviceInterface;
+    logStep(
+      `追踪关键 Service: var=${primaryServiceCall.service_var}, type=${serviceType}, method=${primaryServiceCall.service_method}`
+    );
+    const serviceImport = controllerImports[serviceType];
+    const serviceInterface = await findJavaTypeFile(serviceType, document, serviceImport, 120);
+    const serviceImpl = await findServiceImplFile(serviceType, serviceImport, document, 240);
+    const serviceFile = serviceImpl || serviceInterface;
 
-      if (!serviceFile) {
-        logStep(`未找到 Service 文件: ${serviceType}`);
-        continue;
-      }
-
+    if (!serviceFile) {
+      logStep(`未找到 Service 文件: ${serviceType}`);
+    } else {
       const serviceText = await fs.readFile(serviceFile.fsPath, 'utf8');
       logStep(`命中 Service 文件: ${serviceFile.fsPath}`);
       const serviceStageResult = (await runReActStep({
@@ -158,8 +168,8 @@ export async function collectProjectContextForPrompt(
         systemPrompt,
         prompt: buildServiceStagePrompt({
           serviceType,
-          serviceMethod: serviceCall.service_method,
-          serviceCallExpr: serviceCall.call_expression || '',
+          serviceMethod: primaryServiceCall.service_method,
+          serviceCallExpr: primaryServiceCall.call_expression || '',
           serviceFilePath: serviceFile.fsPath,
           serviceSource: serviceText,
           projectStructureHint
@@ -171,7 +181,7 @@ export async function collectProjectContextForPrompt(
         [
           `[Service证据]`,
           `类型: ${serviceType}`,
-          `方法: ${serviceCall.service_method}`,
+          `方法: ${primaryServiceCall.service_method}`,
           `文件: ${serviceFile.fsPath}`,
           serviceSnippet ? trimText(serviceSnippet, 8000) : trimText(serviceText, 5000)
         ].join('\n')
@@ -180,67 +190,66 @@ export async function collectProjectContextForPrompt(
       const mapperCalls = normalizeMapperCalls(serviceStageResult.mapper_calls);
       logStep(`Service 阶段完成: mapperCallCount=${mapperCalls.length}`);
 
-      const serviceImports = parseImports(serviceText);
-      for (const mapperCall of mapperCalls) {
-        const mapperType = baseJavaTypeName(mapperCall.mapper_type);
-        if (!mapperType) {
-          continue;
+      const primaryMapperCall = pickPrimaryMapperCall(mapperCalls);
+      if (primaryMapperCall) {
+        if (mapperCalls.length > 1) {
+          logStep(`Service 阶段仅保留最关键 Mapper: total=${mapperCalls.length}, selected=1`);
         }
+        const mapperType = baseJavaTypeName(primaryMapperCall.mapper_type);
+        if (mapperType) {
+          logStep(`追踪关键 Mapper: type=${mapperType}, method=${primaryMapperCall.mapper_method || 'N/A'}`);
+          const serviceImports = parseImports(serviceText);
+          const mapperImport = serviceImports[mapperType];
+          const mapperFile = await findJavaTypeFile(mapperType, document, mapperImport, 160);
+          if (!mapperFile) {
+            logStep(`未找到 Mapper 文件: ${mapperType}`);
+          } else {
+            const mapperText = await fs.readFile(mapperFile.fsPath, 'utf8');
+            const mapperStageResult = await runReActStep({
+              stageName: 'Mapper->SQL',
+              logger,
+              endpoint: aiEndpoint,
+              apiKey: aiApiKey,
+              model: aiModel,
+              systemPrompt,
+              prompt: buildMapperStagePrompt({
+                mapperType,
+                mapperMethod: primaryMapperCall.mapper_method,
+                mapperFilePath: mapperFile.fsPath,
+                mapperSource: mapperText,
+                projectStructureHint
+              })
+            });
 
-        logStep(`追踪 Mapper: type=${mapperType}, method=${mapperCall.mapper_method || 'N/A'}`);
-        const mapperImport = serviceImports[mapperType];
-        const mapperFile = await findJavaTypeFile(mapperType, document, mapperImport, 160);
-        if (!mapperFile) {
-          logStep(`未找到 Mapper 文件: ${mapperType}`);
-          continue;
-        }
-
-        const mapperText = await fs.readFile(mapperFile.fsPath, 'utf8');
-        const mapperStageResult = await runReActStep({
-          stageName: 'Mapper->SQL',
-          logger,
-          endpoint: aiEndpoint,
-          apiKey: aiApiKey,
-          model: aiModel,
-          systemPrompt,
-          prompt: buildMapperStagePrompt({
-            mapperType,
-            mapperMethod: mapperCall.mapper_method,
-            mapperFilePath: mapperFile.fsPath,
-            mapperSource: mapperText,
-            projectStructureHint
-          })
-        });
-
-        const sqlResources = normalizeStringArray(mapperStageResult.sql_resources);
-        logStep(`Mapper 阶段完成: sqlResourceCount=${sqlResources.length}`);
-        for (const resourceName of sqlResources) {
-          const normalized = resourceName.trim();
-          if (!normalized) {
-            continue;
+            const sqlResources = normalizeStringArray(mapperStageResult.sql_resources);
+            logStep(`Mapper 阶段完成: sqlResourceCount=${sqlResources.length}`);
+            const primarySqlResource = pickPrimaryString(sqlResources);
+            if (primarySqlResource) {
+              if (sqlResources.length > 1) {
+                logStep(`Mapper 阶段仅保留最关键 SQL 资源: total=${sqlResources.length}, selected=1`);
+              }
+              const normalized = primarySqlResource.trim();
+              const sqlFile = await findSqlFileByResource(normalized, currentDir);
+              if (!sqlFile) {
+                logStep(`未找到 SQL 文件: resource=${normalized}`);
+              } else {
+                logStep(`命中 SQL 文件: resource=${normalized}, file=${sqlFile.fsPath}`);
+                const sqlText = await fs.readFile(sqlFile.fsPath, 'utf8');
+                const targetSql = extractBeetlSqlByMethod(sqlText, primaryMapperCall.mapper_method);
+                sqlSections.push(
+                  [
+                    '[SQL证据]',
+                    `资源名: ${normalized}`,
+                    `文件: ${sqlFile.fsPath}`,
+                    `方法: ${primaryMapperCall.mapper_method}`,
+                    targetSql
+                      ? trimText(targetSql, 9000)
+                      : `未在 SQL 资源中找到方法 ${primaryMapperCall.mapper_method} 的实现`
+                  ].join('\n')
+                );
+              }
+            }
           }
-
-          const sqlKey = normalized.toLowerCase();
-          if (sqlSeen.has(sqlKey)) {
-            continue;
-          }
-          sqlSeen.add(sqlKey);
-
-          const sqlFile = await findSqlFileByResource(normalized, currentDir);
-          if (!sqlFile) {
-            logStep(`未找到 SQL 文件: resource=${normalized}`);
-            continue;
-          }
-          logStep(`命中 SQL 文件: resource=${normalized}, file=${sqlFile.fsPath}`);
-          const sqlText = await fs.readFile(sqlFile.fsPath, 'utf8');
-          sqlSections.push(
-            [
-              '[SQL证据]',
-              `资源名: ${normalized}`,
-              `文件: ${sqlFile.fsPath}`,
-              trimText(sqlText, 9000)
-            ].join('\n')
-          );
         }
       }
     }
@@ -339,7 +348,8 @@ function buildControllerStagePrompt(input: {
     '1) 必须解析目标方法 methodName 对应的方法体。',
     '2) 必须解析 Controller 中全部注入信息，包含字段注入和构造注入。',
     '3) 从方法体里识别出真正参与调用链的 Service 调用（例如 xxxService.queryByPage(...)）。',
-    '4) 输出严格 JSON 对象。',
+    '4) 仅保留最关键的一个 Service 调用，service_calls 最多返回 1 项。',
+    '5) 输出严格 JSON 对象。',
     'JSON 结构:',
     '{',
     '  "target_method": "string",',
@@ -370,7 +380,8 @@ function buildServiceStagePrompt(input: {
     '要求:',
     '1) 定位 serviceMethod 在 serviceSource 中的核心实现片段（优先实现类）。',
     '2) 从该实现片段中提取 Mapper 调用（mapperType + mapperMethod）。',
-    '3) 只输出 JSON 对象，不输出 markdown。',
+    '3) 仅保留最关键的一个 Mapper 调用，mapper_calls 最多返回 1 项。',
+    '4) 只输出 JSON 对象，不输出 markdown。',
     'JSON 结构:',
     '{',
     '  "service_method_snippet": "string",',
@@ -400,8 +411,9 @@ function buildMapperStagePrompt(input: {
     '要求:',
     '1) 从 mapperSource 中提取 SQL 资源名（如 @SqlResource("mcSkuInfo") -> mcSkuInfo）。',
     '2) 同时允许从命名或注释中推断候选 SQL 资源名。',
-    '3) 不输出 Mapper 原文。',
-    '4) 仅输出 JSON 对象。',
+    '3) 仅保留最关键的一个 SQL 资源名，sql_resources 最多返回 1 项。',
+    '4) 不输出 Mapper 原文。',
+    '5) 仅输出 JSON 对象。',
     'JSON 结构:',
     '{',
     '  "sql_resources": ["string"],',
@@ -529,6 +541,18 @@ function normalizeStringArray(raw: unknown): string[] {
     result.push(text);
   }
   return result;
+}
+
+function pickPrimaryServiceCall(items: ServiceCallInfo[]): ServiceCallInfo | undefined {
+  return items[0];
+}
+
+function pickPrimaryMapperCall(items: MapperCallInfo[]): MapperCallInfo | undefined {
+  return items[0];
+}
+
+function pickPrimaryString(items: string[]): string | undefined {
+  return items[0];
 }
 
 async function findJavaTypeFile(
@@ -735,6 +759,34 @@ function trimText(text: string, maxLength: number): string {
     return text || '';
   }
   return `${text.slice(0, maxLength)}\n// ...内容过长，已截断`;
+}
+
+function extractBeetlSqlByMethod(sqlText: string, mapperMethod: string): string {
+  const method = String(mapperMethod || '').trim();
+  if (!sqlText || !method) {
+    return '';
+  }
+
+  const sectionRegex = new RegExp(
+    `(^|\\r?\\n)\\s*${escapeRegExp(method)}\\s*\\r?\\n\\s*=+\\s*\\r?\\n([\\s\\S]*?)(?=\\r?\\n\\s*[^\\r\\n]+\\s*\\r?\\n\\s*=+\\s*\\r?\\n|$)`,
+    'i'
+  );
+  const sectionMatch = sectionRegex.exec(sqlText);
+  if (!sectionMatch) {
+    return '';
+  }
+
+  const sectionBody = String(sectionMatch[2] || '').trim();
+  if (!sectionBody) {
+    return '';
+  }
+
+  const codeFenceMatch = /```(?:sql)?\s*([\s\S]*?)```/i.exec(sectionBody);
+  if (codeFenceMatch && String(codeFenceMatch[1] || '').trim()) {
+    return String(codeFenceMatch[1]).trim();
+  }
+
+  return sectionBody;
 }
 
 function escapeRegExp(value: string): string {

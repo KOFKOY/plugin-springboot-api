@@ -1,5 +1,8 @@
 ## Generate .http files from SpringBoot Controller mappings, with optional AI-generated test parameters.
 
+## Applicable frameworks
+springboot beetlsql
+
 ## Requirements
 REST Client extension (recommended but not required)
 
