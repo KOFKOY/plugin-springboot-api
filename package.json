@@ -1,0 +1,129 @@
+{
+  "name": "rest-client-for-springboot",
+  "displayName": "SpringBoot HTTP Helper",
+  "description": "Generate .http files from SpringBoot Controller mappings, with optional AI-generated test parameters.",
+  "version": "0.0.4",
+  "icon": "icon.png",
+  "publisher": "tangtang-wsj",
+  "engines": {
+    "vscode": "^1.112.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onCommand:springHttpGenerator.createHttpFromMapping"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "springHttpGenerator.createHttpFromMapping",
+        "title": "SpringBoot: 生成 Controller HTTP 请求"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "springHttpGenerator.createHttpFromMapping",
+          "when": "editorTextFocus && editorLangId == java",
+          "group": "navigation@10"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "SpringBoot HTTP Helper",
+      "properties": {
+        "springHttpGenerator.baseUrl": {
+          "type": "string",
+          "default": "http://localhost:8080",
+          "description": "生成 .http 请求时默认使用的服务地址"
+        },
+        "springHttpGenerator.tokenVarName": {
+          "type": "string",
+          "default": "token",
+          "description": "REST Client 中 token 变量名"
+        },
+        "springHttpGenerator.tokenValue": {
+          "type": "string",
+          "default": "",
+          "description": "固定测试 token 值，配置后会自动写入 .http 文件变量，避免重复手填"
+        },
+        "springHttpGenerator.autoFillTestParams": {
+          "type": "boolean",
+          "default": true,
+          "description": "是否自动填充测试参数"
+        },
+        "springHttpGenerator.commonPropertyHints": {
+          "type": "object",
+          "default": {
+            "id": "1",
+            "pageNum": 1,
+            "pageSize": 10,
+            "name": "测试名称",
+            "status": "ENABLED"
+          },
+          "description": "参数填充提示，key 为字段名，value 为默认示例值"
+        },
+        "springHttpGenerator.ai.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "是否启用 AI 生成测试参数（Responses 协议）"
+        },
+        "springHttpGenerator.ai.endpoint": {
+          "type": "string",
+          "default": "https://api.openai.com/v1/responses",
+          "description": "OpenAI Responses 接口地址"
+        },
+        "springHttpGenerator.ai.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "OpenAI API Key"
+        },
+        "springHttpGenerator.ai.model": {
+          "type": "string",
+          "default": "gpt-5.1-codex-max",
+          "description": "AI 模型名称"
+        },
+        "springHttpGenerator.ai.contextAgentPrompt": {
+          "type": "string",
+          "default": "你是代码检索智能体，采用 ReAct（Reason + Act）工作流。按 Controller -> Service -> Mapper -> SQL 顺序定位上下文，只输出结构化 JSON，最终仅返回 Service 与 SQL 的有效证据，不返回 Mapper 内容本体。优先结合方法体调用、字段注入与构造注入推断 Service。",
+          "description": "上下文检索智能体提示词（ReAct）。用于指导 AI 从 Controller 逐步定位 Service/Mapper/SQL，并将 Service+SQL 证据回填到主 Prompt。"
+        },
+        "springHttpGenerator.ai.testDataFile": {
+          "type": "string",
+          "default": "",
+          "description": "测试数据池文件路径（绝对路径或相对项目根目录）。为空时优先读取项目内 data/test-data-pools(.json)，不存在则读取插件内置数据"
+        },
+        "springHttpGenerator.ai.projectStructureHint": {
+          "type": "string",
+          "default": "",
+          "description": "项目结构提示词（可描述 service/mapper/sql 所在目录及命名约定，帮助 AI 更快定位关键上下文）"
+        },
+        "springHttpGenerator.ai.systemPrompt": {
+          "type": "string",
+          "default": "你是接口测试参数生成助手。仅输出 JSON 对象，且仅保留关键字段，禁止输出 aid 和 修改时间。",
+          "description": "AI 系统提示词"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile && npm run lint",
+    "lint": "eslint src",
+    "test": "vscode-test"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.112.0",
+    "@types/mocha": "^10.0.10",
+    "@types/node": "22.x",
+    "typescript-eslint": "^8.56.1",
+    "eslint": "^9.39.3",
+    "typescript": "^5.9.3",
+    "@vscode/test-cli": "^0.0.12",
+    "@vscode/test-electron": "^2.5.2"
+  }
+}
