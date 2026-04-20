@@ -307,7 +307,8 @@ async function runReActStep(input: ReActStepInput): Promise<Record<string, unkno
         role: 'user',
         content: [{ type: 'input_text', text: prompt }]
       }
-    ]
+    ],
+    reasoning:{"effort":"low"}
   };
 
   const response = await fetch(endpoint, {
