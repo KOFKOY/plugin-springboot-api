@@ -2,9 +2,16 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 
+// 文件作用: 采集 Controller -> Service -> Mapper -> SQL 的业务上下文，供请求体 AI 生成阶段复用。
 const EXCLUDE_GLOB = '**/{target,build,out,node_modules,.git,dist}/**';
-const DEFAULT_REACT_PROMPT =
-  '你是代码检索智能体，采用 ReAct（Reason + Act）范式。按 Controller -> Service -> Mapper -> SQL 顺序进行定位。每一层只保留最关键的一条链路：最多 1 个 Service、最多 1 个 Mapper、最多 1 个 SQL 资源。必须只输出 JSON，不允许 markdown 和解释。最终目标是提取对生成接口测试参数有价值的 Service 与 SQL 证据，忽略 Mapper 样板内容。';
+const DEFAULT_SQL_SEARCH_GLOBS = [
+  '**/src/main/resources/sql/**/*.{md,sql,xml}',
+  '**/src/main/resources/**/*Mapper.xml',
+  '**/*.{md,sql,xml}'
+];
+const CONTEXT_CACHE_LIMIT = 200;
+const CONTEXT_CACHE = new Map<string, ContextAgentResult>();
+const SQL_CANDIDATE_CACHE = new Map<string, vscode.Uri[]>();
 
 type ContextLogLevel = 'INFO' | 'STEP' | 'ERROR';
 type ContextLogger = (level: ContextLogLevel, message: string) => void;
@@ -12,11 +19,11 @@ type ContextLogger = (level: ContextLogLevel, message: string) => void;
 interface ContextAgentOptions {
   document: vscode.TextDocument;
   methodName: string;
-  projectStructureHint?: string;
   aiEndpoint: string;
   aiApiKey: string;
   aiModel: string;
   reactSystemPrompt?: string;
+  sqlSearchGlobs?: string[];
   logger?: ContextLogger;
 }
 
@@ -28,246 +35,191 @@ interface ContextAgentResult {
 interface InjectionInfo {
   name: string;
   type: string;
-  inject_mode?: string;
+  inject_mode: 'field' | 'constructor' | 'other';
 }
 
-interface ServiceCallInfo {
-  service_var: string;
-  service_type: string;
-  service_method: string;
-  call_expression?: string;
-  reason?: string;
+interface MemberCallInfo {
+  owner: string;
+  method: string;
+  expression: string;
+  index: number;
 }
 
-interface MapperCallInfo {
-  mapper_type: string;
-  mapper_method: string;
-  reason?: string;
-}
-
-interface ServiceReactResult {
-  service_method_snippet?: string;
-  mapper_calls?: MapperCallInfo[];
-}
-
-interface ReActStepInput {
-  stageName: string;
-  logger?: ContextLogger;
-  endpoint: string;
-  apiKey: string;
-  model: string;
-  systemPrompt: string;
-  prompt: string;
+interface MethodSnippetInfo {
+  snippet: string;
+  startOffset: number;
+  endOffset: number;
+  signature: string;
 }
 
 export async function collectProjectContextForPrompt(
   options: ContextAgentOptions
 ): Promise<ContextAgentResult> {
-  const {
-    document,
-    methodName,
-    projectStructureHint = '',
-    aiEndpoint,
-    aiApiKey,
-    aiModel,
-    reactSystemPrompt = '',
-    logger
-  } = options || ({} as ContextAgentOptions);
+  const { document, methodName, sqlSearchGlobs = DEFAULT_SQL_SEARCH_GLOBS, logger } =
+    options || ({} as ContextAgentOptions);
 
   const logStep = (message: string): void => {
-    logger?.('STEP', `[AI上下文] ${message}`);
+    logger?.('STEP', `[本地上下文] ${message}`);
   };
   const logError = (message: string): void => {
-    logger?.('ERROR', `[AI上下文] ${message}`);
+    logger?.('ERROR', `[本地上下文] ${message}`);
   };
 
   if (!document || !methodName) {
-    logStep('缺少 document 或 methodName，未采集上下文');
-    return { contextText: '', summary: '缺少 document 或 methodName，未采集业务上下文' };
+    return {
+      contextText: '',
+      summary: '缺少 document 或 methodName，未采集业务上下文'
+    };
   }
-  if (!aiEndpoint || !aiApiKey || !aiModel) {
-    throw new Error('AI 上下文采集缺少 endpoint/apiKey/model 配置');
-  }
-
-  const systemPrompt = reactSystemPrompt.trim() || DEFAULT_REACT_PROMPT;
-  const currentDir = path.dirname(document.uri.fsPath).toLowerCase();
 
   try {
-    const controllerText = document.getText();
-    logStep(`开始 ReAct 上下文采集: method=${methodName}, file=${document.fileName}`);
+    const controllerText = await readSourceFileByPath(document.uri.fsPath);
+    const cacheKey = buildContextCacheKey(document.uri.fsPath, methodName, controllerText);
+    const cached = CONTEXT_CACHE.get(cacheKey);
+    if (cached) {
+      // 关键逻辑: 相同文件内容与方法名直接复用上下文，避免重复链路解析。
+      logStep(`命中上下文缓存: method=${methodName}`);
+      return cached;
+    }
 
-    const controllerResult = await runReActStep({
-      stageName: 'Controller->Service',
-      logger,
-      endpoint: aiEndpoint,
-      apiKey: aiApiKey,
-      model: aiModel,
-      systemPrompt,
-      prompt: buildControllerStagePrompt({
-        controllerFile: document.fileName,
-        methodName,
-        projectStructureHint,
-        controllerText
-      })
-    });
+    const currentDir = path.dirname(document.uri.fsPath).toLowerCase();
+    const methodInfo = extractJavaMethodSnippet(controllerText, methodName);
+    if (!methodInfo) {
+      const result = {
+        contextText: `[AI上下文]\n未定位到目标方法实现。\n目标方法: ${methodName}`,
+        summary: '未定位到目标方法实现'
+      };
+      setContextCache(cacheKey, result);
+      return result;
+    }
 
-    const injections = normalizeInjections(controllerResult.injections);
-    const serviceCalls = normalizeServiceCalls(controllerResult.service_calls, injections);
-    if (serviceCalls.length === 0) {
-      logStep('Controller 阶段未识别到 Service 调用');
-      return {
+    logStep(`开始本地链路解析: method=${methodName}, file=${document.fileName}`);
+    const controllerImports = parseImports(controllerText);
+    logStep(`Controller源码: ${controllerText}`);
+    const controllerInjections = parseInjectedFields(controllerText, controllerImports);
+    let serviceCallOffsetBase = methodInfo.startOffset;
+    let serviceCandidates = pickServiceCalls(methodInfo.snippet, controllerInjections, controllerImports);
+    if (serviceCandidates.length === 0) {
+      // 关键逻辑: 目标方法片段未命中时回退 Controller 全文扫描，避免因局部代码导致 Service 线索丢失。
+      logStep('目标方法片段未命中 Service 调用，回退到 Controller 全文扫描');
+      serviceCandidates = pickServiceCalls(controllerText, controllerInjections, controllerImports);
+      serviceCallOffsetBase = 0;
+    }
+    if (serviceCandidates.length === 0) {
+      const result = {
         contextText: `[AI上下文]\nController 未识别到 Service 调用。\n目标方法: ${methodName}`,
         summary: '未识别 Service 调用'
       };
-    }
-    logStep(`Controller 阶段完成: serviceCallCount=${serviceCalls.length}`);
-
-    const controllerImports = parseImports(controllerText);
-    const serviceSections: string[] = [];
-    const sqlSections: string[] = [];
-    const primaryServiceCall = pickPrimaryServiceCall(serviceCalls);
-    if (!primaryServiceCall) {
-      logStep('Controller 阶段未选出关键 Service 调用');
-      return {
-        contextText: `[AI上下文]\nController 未选出关键 Service 调用。\n目标方法: ${methodName}`,
-        summary: '未选出关键 Service 调用'
-      };
-    }
-    if (serviceCalls.length > 1) {
-      logStep(`Controller 阶段仅保留最关键 Service: total=${serviceCalls.length}, selected=1`);
+      setContextCache(cacheKey, result);
+      return result;
     }
 
-    const serviceType = baseJavaTypeName(primaryServiceCall.service_type);
-    if (!serviceType || !primaryServiceCall.service_method) {
-      logStep(`关键 Service 调用项无效: ${JSON.stringify(primaryServiceCall)}`);
-      return {
-        contextText: `[AI上下文]\n关键 Service 调用项无效。\n目标方法: ${methodName}`,
-        summary: '关键 Service 调用项无效'
-      };
-    }
+    const primaryServiceCall = serviceCandidates[0];
+    const serviceType = baseJavaTypeName(primaryServiceCall.type);
+    const serviceCallOffset = serviceCallOffsetBase + primaryServiceCall.call.index;
+    logStep(`命中 Service 调用: var=${primaryServiceCall.call.owner}, type=${serviceType}, method=${primaryServiceCall.call.method}`);
 
-    logStep(
-      `追踪关键 Service: var=${primaryServiceCall.service_var}, type=${serviceType}, method=${primaryServiceCall.service_method}`
-    );
     const serviceImport = controllerImports[serviceType];
-    const serviceInterface = await findJavaTypeFile(serviceType, document, serviceImport, 120);
-    const serviceImpl = await findServiceImplFile(serviceType, serviceImport, document, 240);
-    const serviceFile = serviceImpl || serviceInterface;
+    // 关键逻辑: 路径解析优先级为“定义跳转 -> import 精确匹配 -> 全局检索兜底”。
+    let serviceFile =
+      (await resolveTypeFileByDefinition(document, serviceCallOffset, serviceType)) ||
+      (await findServiceImplFile(serviceType, serviceImport, document, 240)) ||
+      (await findJavaTypeFile(serviceType, document, serviceImport, 140));
 
     if (!serviceFile) {
-      logStep(`未找到 Service 文件: ${serviceType}`);
-    } else {
-      const serviceText = await fs.readFile(serviceFile.fsPath, 'utf8');
-      logStep(`命中 Service 文件: ${serviceFile.fsPath}`);
-      const serviceStageResult = (await runReActStep({
-        stageName: 'Service->Mapper',
-        logger,
-        endpoint: aiEndpoint,
-        apiKey: aiApiKey,
-        model: aiModel,
-        systemPrompt,
-        prompt: buildServiceStagePrompt({
-          serviceType,
-          serviceMethod: primaryServiceCall.service_method,
-          serviceCallExpr: primaryServiceCall.call_expression || '',
-          serviceFilePath: serviceFile.fsPath,
-          serviceSource: serviceText,
-          projectStructureHint
-        })
-      })) as ServiceReactResult;
+      const result = {
+        contextText: `[AI上下文]\n未找到 Service 文件。\n类型: ${serviceType}`,
+        summary: '未找到 Service 文件'
+      };
+      setContextCache(cacheKey, result);
+      return result;
+    }
 
-      const serviceSnippet = String(serviceStageResult.service_method_snippet || '').trim();
-      serviceSections.push(
-        [
-          `[Service证据]`,
-          `类型: ${serviceType}`,
-          `方法: ${primaryServiceCall.service_method}`,
-          `文件: ${serviceFile.fsPath}`,
-          serviceSnippet ? trimText(serviceSnippet, 8000) : trimText(serviceText, 5000)
-        ].join('\n')
-      );
+    let serviceText = await fs.readFile(serviceFile.fsPath, 'utf8');
+    let serviceMethodInfo = extractJavaMethodSnippet(serviceText, primaryServiceCall.call.method);
+    if (!serviceMethodInfo && !/Impl\.java$/i.test(serviceFile.fsPath)) {
+      const implFile = await findServiceImplFile(serviceType, serviceImport, document, 240);
+      if (implFile && normalizePath(implFile.fsPath) !== normalizePath(serviceFile.fsPath)) {
+        serviceFile = implFile;
+        serviceText = await fs.readFile(serviceFile.fsPath, 'utf8');
+        serviceMethodInfo = extractJavaMethodSnippet(serviceText, primaryServiceCall.call.method);
+      }
+    }
+    logStep(`命中 Service 文件: ${serviceFile.fsPath}`);
 
-      const mapperCalls = normalizeMapperCalls(serviceStageResult.mapper_calls);
-      logStep(`Service 阶段完成: mapperCallCount=${mapperCalls.length}`);
+    const serviceSnippet = serviceMethodInfo ? serviceMethodInfo.snippet : trimText(serviceText, 5000);
+    const serviceSections = [
+      [
+        '[Service证据]',
+        `类型: ${serviceType}`,
+        `方法: ${primaryServiceCall.call.method}`,
+        `文件: ${serviceFile.fsPath}`,
+        trimText(serviceSnippet, 8000)
+      ].join('\n')
+    ];
 
-      const primaryMapperCall = pickPrimaryMapperCall(mapperCalls);
-      if (primaryMapperCall) {
-        if (mapperCalls.length > 1) {
-          logStep(`Service 阶段仅保留最关键 Mapper: total=${mapperCalls.length}, selected=1`);
-        }
-        const mapperType = baseJavaTypeName(primaryMapperCall.mapper_type);
-        if (mapperType) {
-          logStep(`追踪关键 Mapper: type=${mapperType}, method=${primaryMapperCall.mapper_method || 'N/A'}`);
-          const serviceImports = parseImports(serviceText);
-          const mapperImport = serviceImports[mapperType];
-          const mapperFile = await findJavaTypeFile(mapperType, document, mapperImport, 160);
-          if (!mapperFile) {
-            logStep(`未找到 Mapper 文件: ${mapperType}`);
-          } else {
-            const mapperText = await fs.readFile(mapperFile.fsPath, 'utf8');
-            const mapperStageResult = await runReActStep({
-              stageName: 'Mapper->SQL',
-              logger,
-              endpoint: aiEndpoint,
-              apiKey: aiApiKey,
-              model: aiModel,
-              systemPrompt,
-              prompt: buildMapperStagePrompt({
-                mapperType,
-                mapperMethod: primaryMapperCall.mapper_method,
-                mapperFilePath: mapperFile.fsPath,
-                mapperSource: mapperText,
-                projectStructureHint
-              })
-            });
+    let sqlSections: string[] = [];
+    if (serviceMethodInfo) {
+      const serviceImports = parseImports(serviceText);
+      const serviceInjections = parseInjectedFields(serviceText, serviceImports);
+      const mapperCandidates = pickMapperCalls(serviceMethodInfo.snippet, serviceInjections, serviceImports);
+      if (mapperCandidates.length > 0) {
+        const primaryMapperCall = mapperCandidates[0];
+        const mapperType = baseJavaTypeName(primaryMapperCall.type);
+        const mapperCallOffset = serviceMethodInfo.startOffset + primaryMapperCall.call.index;
+        logStep(`命中 Mapper 调用: var=${primaryMapperCall.call.owner}, type=${mapperType}, method=${primaryMapperCall.call.method}`);
 
-            const sqlResources = normalizeStringArray(mapperStageResult.sql_resources);
-            logStep(`Mapper 阶段完成: sqlResourceCount=${sqlResources.length}`);
-            const primarySqlResource = pickPrimaryString(sqlResources);
-            if (primarySqlResource) {
-              if (sqlResources.length > 1) {
-                logStep(`Mapper 阶段仅保留最关键 SQL 资源: total=${sqlResources.length}, selected=1`);
-              }
-              const normalized = primarySqlResource.trim();
-              const sqlFile = await findSqlFileByResource(normalized, currentDir);
-              if (!sqlFile) {
-                logStep(`未找到 SQL 文件: resource=${normalized}`);
-              } else {
-                logStep(`命中 SQL 文件: resource=${normalized}, file=${sqlFile.fsPath}`);
-                const sqlText = await fs.readFile(sqlFile.fsPath, 'utf8');
-                const targetSql = extractBeetlSqlByMethod(sqlText, primaryMapperCall.mapper_method);
-                sqlSections.push(
-                  [
-                    '[SQL证据]',
-                    `资源名: ${normalized}`,
-                    `文件: ${sqlFile.fsPath}`,
-                    `方法: ${primaryMapperCall.mapper_method}`,
-                    targetSql
-                      ? trimText(targetSql, 9000)
-                      : `未在 SQL 资源中找到方法 ${primaryMapperCall.mapper_method} 的实现`
-                  ].join('\n')
-                );
-              }
-            }
+        const serviceDocument = await vscode.workspace.openTextDocument(serviceFile);
+        const mapperImport = serviceImports[mapperType];
+        const mapperFile =
+          (await resolveTypeFileByDefinition(serviceDocument, mapperCallOffset, mapperType)) ||
+          (await findJavaTypeFile(mapperType, serviceDocument, mapperImport, 180));
+
+        if (mapperFile) {
+          const mapperText = await fs.readFile(mapperFile.fsPath, 'utf8');
+          logStep(`命中 Mapper 文件: ${mapperFile.fsPath}`);
+          const sqlResources = extractSqlResourceNames(mapperText, mapperType);
+          const matched = await resolveSqlEvidence(
+            sqlResources,
+            currentDir,
+            sqlSearchGlobs,
+            primaryMapperCall.call.method
+          );
+          if (matched) {
+            const sqlText = await fs.readFile(matched.file.fsPath, 'utf8');
+            const sqlSnippet = extractSqlByMethod(sqlText, primaryMapperCall.call.method, matched.file.fsPath);
+            sqlSections = [
+              [
+                '[SQL证据]',
+                `资源名: ${matched.resource}`,
+                `文件: ${matched.file.fsPath}`,
+                `方法: ${primaryMapperCall.call.method}`,
+                trimText(
+                  sqlSnippet || `未在 SQL 资源中找到方法 ${primaryMapperCall.call.method} 的实现`,
+                  9000
+                )
+              ].join('\n')
+            ];
+            logStep(`命中 SQL 文件: resource=${matched.resource}, file=${matched.file.fsPath}`);
           }
         }
       }
     }
 
     if (serviceSections.length === 0 && sqlSections.length === 0) {
-      logStep('ReAct 采集完成，但未形成有效 Service/SQL 证据');
-      return {
+      const result = {
         contextText: `[AI上下文]\n未找到可用 Service/SQL 证据。\n目标方法: ${methodName}`,
         summary: '未形成有效 Service/SQL 证据'
       };
+      setContextCache(cacheKey, result);
+      return result;
     }
 
     const contextText = trimText(
       [
-        '[ReAct上下文采集结果]',
+        '[本地上下文采集结果]',
         `Controller文件: ${document.fileName}`,
         `目标方法: ${methodName}`,
-        projectStructureHint ? `[项目结构提示]\n${projectStructureHint}` : '',
         serviceSections.join('\n\n'),
         sqlSections.join('\n\n')
       ]
@@ -275,13 +227,13 @@ export async function collectProjectContextForPrompt(
         .join('\n\n'),
       26000
     );
-
-    const summary = `Service证据 ${serviceSections.length} 段, SQL证据 ${sqlSections.length} 段`;
-    logStep(`ReAct 上下文采集结束: ${summary}`);
-    return {
+    const result = {
       contextText,
-      summary
+      summary: `Service证据 ${serviceSections.length} 段, SQL证据 ${sqlSections.length} 段`
     };
+    setContextCache(cacheKey, result);
+    logStep(`本地链路解析结束: ${result.summary}`);
+    return result;
   } catch (error) {
     const message = error instanceof Error ? `${error.message}\n${error.stack || ''}` : String(error);
     logError(`上下文采集失败: ${message}`);
@@ -292,268 +244,601 @@ export async function collectProjectContextForPrompt(
   }
 }
 
-async function runReActStep(input: ReActStepInput): Promise<Record<string, unknown>> {
-  const { stageName, logger, endpoint, apiKey, model, systemPrompt, prompt } = input;
-  logger?.('STEP', `[AI上下文][${stageName}] 请求发送中`);
+function buildContextCacheKey(filePath: string, methodName: string, text: string): string {
+  const normalizedPath = normalizePath(filePath);
+  const textHash = hashText(text);
+  return `${normalizedPath}::${methodName}::${textHash}`;
+}
 
-  const payload = {
-    model,
-    input: [
-      {
-        role: 'system',
-        content: [{ type: 'input_text', text: systemPrompt }]
-      },
-      {
-        role: 'user',
-        content: [{ type: 'input_text', text: prompt }]
+async function readSourceFileByPath(filePath: string): Promise<string> {
+  if (!filePath) {
+    throw new Error('源码路径为空，无法读取 Controller 源码');
+  }
+  return fs.readFile(filePath, 'utf8');
+}
+
+function setContextCache(key: string, value: ContextAgentResult): void {
+  if (CONTEXT_CACHE.size >= CONTEXT_CACHE_LIMIT) {
+    const oldestKey = CONTEXT_CACHE.keys().next().value as string | undefined;
+    if (oldestKey) {
+      CONTEXT_CACHE.delete(oldestKey);
+    }
+  }
+  CONTEXT_CACHE.set(key, value);
+}
+
+function hashText(text: string): string {
+  let hash = 2166136261;
+  for (let i = 0; i < text.length; i += 1) {
+    hash ^= text.charCodeAt(i);
+    hash +=
+      (hash << 1) + (hash << 4) + (hash << 7) + (hash << 8) + (hash << 24);
+  }
+  return (hash >>> 0).toString(16);
+}
+
+function extractJavaMethodSnippet(javaText: string, methodName: string): MethodSnippetInfo | undefined {
+  if (!javaText || !methodName) {
+    return undefined;
+  }
+  const methodRegex = new RegExp(`\\b${escapeRegExp(methodName)}\\s*\\(`, 'g');
+  let match = methodRegex.exec(javaText);
+  while (match) {
+    const methodNameIndex = match.index;
+    const charBefore = findPreviousNonWhitespaceChar(javaText, methodNameIndex - 1);
+    if (charBefore === '.') {
+      match = methodRegex.exec(javaText);
+      continue;
+    }
+
+    const openParenIndex = javaText.indexOf('(', methodNameIndex);
+    if (openParenIndex < 0) {
+      match = methodRegex.exec(javaText);
+      continue;
+    }
+    const closeParenIndex = findMatchingPair(javaText, openParenIndex, '(', ')');
+    if (closeParenIndex < 0) {
+      match = methodRegex.exec(javaText);
+      continue;
+    }
+
+    let cursor = closeParenIndex + 1;
+    while (cursor < javaText.length && /\s/.test(javaText[cursor])) {
+      cursor += 1;
+    }
+    while (cursor < javaText.length && javaText.startsWith('throws', cursor)) {
+      cursor += 'throws'.length;
+      while (cursor < javaText.length && javaText[cursor] !== '{' && javaText[cursor] !== ';') {
+        cursor += 1;
       }
-    ],
-    reasoning:{"effort":"low"}
-  };
+    }
 
-  const response = await fetch(endpoint, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiKey}`
-    },
-    body: JSON.stringify(payload)
-  });
+    if (javaText[cursor] !== '{') {
+      match = methodRegex.exec(javaText);
+      continue;
+    }
+    const methodBodyEnd = findMatchingPair(javaText, cursor, '{', '}');
+    if (methodBodyEnd < 0) {
+      match = methodRegex.exec(javaText);
+      continue;
+    }
 
-  logger?.('STEP', `[AI上下文][${stageName}] 请求返回: status=${response.status}`);
-  if (!response.ok) {
-    const body = await response.text();
-    throw new Error(`[${stageName}] OpenAI Responses 请求失败: HTTP ${response.status}, body=${body}`);
+    let methodStart = findLineStart(javaText, methodNameIndex);
+    methodStart = includeAnnotationLines(javaText, methodStart);
+    const snippet = javaText.slice(methodStart, methodBodyEnd + 1).trim();
+    const signature = javaText.slice(methodStart, cursor).trim();
+    return {
+      snippet,
+      startOffset: methodStart,
+      endOffset: methodBodyEnd + 1,
+      signature
+    };
   }
+  return undefined;
+}
 
-  const result = (await response.json()) as Record<string, unknown>;
-  const outputText = extractResponsesOutputText(result);
-  logger?.('STEP', `[AI上下文][${stageName}] 响应文本长度=${outputText.length}`);
-  const parsed = parseFirstJson(outputText);
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    throw new Error(`[${stageName}] 模型输出不是有效 JSON 对象: ${outputText}`);
+function findPreviousNonWhitespaceChar(text: string, startIndex: number): string {
+  for (let i = startIndex; i >= 0; i -= 1) {
+    if (!/\s/.test(text[i])) {
+      return text[i];
+    }
   }
-  return parsed as Record<string, unknown>;
+  return '';
 }
 
-function buildControllerStagePrompt(input: {
-  controllerFile: string;
-  methodName: string;
-  projectStructureHint: string;
-  controllerText: string;
-}): string {
-  const { controllerFile, methodName, projectStructureHint, controllerText } = input;
-  return [
-    '阶段目标: Controller -> Service。',
-    '要求:',
-    '1) 必须解析目标方法 methodName 对应的方法体。',
-    '2) 必须解析 Controller 中全部注入信息，包含字段注入和构造注入。',
-    '3) 从方法体里识别出真正参与调用链的 Service 调用（例如 xxxService.queryByPage(...)）。',
-    '4) 仅保留最关键的一个 Service 调用，service_calls 最多返回 1 项。',
-    '5) 输出严格 JSON 对象。',
-    'JSON 结构:',
-    '{',
-    '  "target_method": "string",',
-    '  "method_body": "string",',
-    '  "injections": [{"name":"string","type":"string","inject_mode":"field|constructor|other"}],',
-    '  "service_calls": [{"service_var":"string","service_type":"string","service_method":"string","call_expression":"string","reason":"string"}]',
-    '}',
-    `controller_file: ${controllerFile}`,
-    `method_name: ${methodName}`,
-    projectStructureHint ? `project_structure_hint: ${projectStructureHint}` : '',
-    `controller_source:\n${trimText(controllerText, 20000)}`
-  ]
-    .filter((item) => item)
-    .join('\n');
-}
-
-function buildServiceStagePrompt(input: {
-  serviceType: string;
-  serviceMethod: string;
-  serviceCallExpr: string;
-  serviceFilePath: string;
-  serviceSource: string;
-  projectStructureHint: string;
-}): string {
-  const { serviceType, serviceMethod, serviceCallExpr, serviceFilePath, serviceSource, projectStructureHint } = input;
-  return [
-    '阶段目标: Service -> Mapper。',
-    '要求:',
-    '1) 定位 serviceMethod 在 serviceSource 中的核心实现片段（优先实现类）。',
-    '2) 从该实现片段中提取 Mapper 调用（mapperType + mapperMethod）。',
-    '3) 仅保留最关键的一个 Mapper 调用，mapper_calls 最多返回 1 项。',
-    '4) 只输出 JSON 对象，不输出 markdown。',
-    'JSON 结构:',
-    '{',
-    '  "service_method_snippet": "string",',
-    '  "mapper_calls": [{"mapper_type":"string","mapper_method":"string","reason":"string"}]',
-    '}',
-    `service_type: ${serviceType}`,
-    `service_method: ${serviceMethod}`,
-    serviceCallExpr ? `service_call_expression_from_controller: ${serviceCallExpr}` : '',
-    `service_file: ${serviceFilePath}`,
-    projectStructureHint ? `project_structure_hint: ${projectStructureHint}` : '',
-    `service_source:\n${trimText(serviceSource, 26000)}`
-  ]
-    .filter((item) => item)
-    .join('\n');
-}
-
-function buildMapperStagePrompt(input: {
-  mapperType: string;
-  mapperMethod: string;
-  mapperFilePath: string;
-  mapperSource: string;
-  projectStructureHint: string;
-}): string {
-  const { mapperType, mapperMethod, mapperFilePath, mapperSource, projectStructureHint } = input;
-  return [
-    '阶段目标: Mapper -> SQL 资源名。',
-    '要求:',
-    '1) 从 mapperSource 中提取 SQL 资源名（如 @SqlResource("mcSkuInfo") -> mcSkuInfo）。',
-    '2) 同时允许从命名或注释中推断候选 SQL 资源名。',
-    '3) 仅保留最关键的一个 SQL 资源名，sql_resources 最多返回 1 项。',
-    '4) 不输出 Mapper 原文。',
-    '5) 仅输出 JSON 对象。',
-    'JSON 结构:',
-    '{',
-    '  "sql_resources": ["string"],',
-    '  "reason": "string"',
-    '}',
-    `mapper_type: ${mapperType}`,
-    mapperMethod ? `mapper_method: ${mapperMethod}` : '',
-    `mapper_file: ${mapperFilePath}`,
-    projectStructureHint ? `project_structure_hint: ${projectStructureHint}` : '',
-    `mapper_source:\n${trimText(mapperSource, 12000)}`
-  ]
-    .filter((item) => item)
-    .join('\n');
-}
-
-function normalizeInjections(raw: unknown): InjectionInfo[] {
-  if (!Array.isArray(raw)) {
-    return [];
+function findMatchingPair(text: string, startIndex: number, left: string, right: string): number {
+  let depth = 0;
+  for (let i = startIndex; i < text.length; i += 1) {
+    const ch = text[i];
+    if (ch === left) {
+      depth += 1;
+      continue;
+    }
+    if (ch === right) {
+      depth -= 1;
+      if (depth === 0) {
+        return i;
+      }
+    }
   }
+  return -1;
+}
+
+function findLineStart(text: string, index: number): number {
+  if (index <= 0) {
+    return 0;
+  }
+  const start = text.lastIndexOf('\n', index);
+  return start === -1 ? 0 : start + 1;
+}
+
+function includeAnnotationLines(text: string, methodStart: number): number {
+  let currentStart = methodStart;
+  while (currentStart > 0) {
+    let prevLineEnd = currentStart - 1;
+    if (prevLineEnd >= 0 && text[prevLineEnd] === '\n') {
+      prevLineEnd -= 1;
+    }
+    if (prevLineEnd < 0) {
+      break;
+    }
+    const prevLineStart = findLineStart(text, prevLineEnd);
+    if (prevLineStart >= currentStart) {
+      break;
+    }
+    const prevLine = text.slice(prevLineStart, prevLineEnd + 1).trim();
+    if (!prevLine || prevLine.startsWith('@')) {
+      currentStart = prevLineStart;
+      continue;
+    }
+    break;
+  }
+  return currentStart;
+}
+
+function parseImports(javaText: string): Record<string, string> {
+  const imports: Record<string, string> = {};
+  const regex = /^\s*import\s+([a-zA-Z0-9_.]+)\s*;/gm;
+  let match = regex.exec(javaText);
+  while (match) {
+    const full = match[1].trim();
+    const simple = full.split('.').at(-1);
+    if (simple) {
+      imports[simple] = full;
+    }
+    match = regex.exec(javaText);
+  }
+  return imports;
+}
+
+function parseInjectedFields(javaText: string, imports: Record<string, string>): InjectionInfo[] {
+  const constructorInjections = parseConstructorInjectedFields(javaText);
+  const hasRequiredArgsConstructor = /@RequiredArgsConstructor\b/.test(javaText);
+  const classBodyRange = findPrimaryClassBodyRange(javaText);
+  const regex =
+    /^\s*(?:(?:private|protected|public)\s+)?(?:(?:final|transient|volatile)\s+)*(?!static\b)([A-Za-z0-9_<>\[\].?, $]+)\s+([A-Za-z0-9_]+)\s*(?:=[^;]*)?;/gm;
+
   const result: InjectionInfo[] = [];
-  for (const item of raw) {
-    if (!item || typeof item !== 'object') {
+  const dedupe = new Set<string>();
+  let match = regex.exec(javaText);
+  while (match) {
+    if (!classBodyRange || !isTopLevelClassMemberPosition(javaText, match.index, classBodyRange)) {
+      match = regex.exec(javaText);
       continue;
     }
-    const data = item as Record<string, unknown>;
-    const name = String(data.name || '').trim();
-    const type = String(data.type || '').trim();
-    if (!name || !type) {
+    const fullType = String(match[1] || '').trim();
+    const name = String(match[2] || '').trim();
+    if (!fullType || !name) {
+      match = regex.exec(javaText);
       continue;
     }
-    result.push({
-      name,
-      type,
-      inject_mode: String(data.inject_mode || '').trim() || 'other'
-    });
+    const lineStart = findLineStart(javaText, match.index);
+    const lineEnd = javaText.indexOf('\n', match.index);
+    const lineText = javaText.slice(lineStart, lineEnd === -1 ? javaText.length : lineEnd);
+    const annotationBlock = findFieldAnnotationBlock(javaText, lineStart);
+    const hasFieldInjectAnnotation = /@(Autowired|Resource|Inject)\b/.test(`${annotationBlock}\n${lineText}`);
+    const isFinal = /\bfinal\b/.test(lineText);
+    const constructorType = constructorInjections.get(name);
+    const type = constructorType || fullType;
+    const injectMode: InjectionInfo['inject_mode'] = constructorType
+      ? 'constructor'
+      : hasFieldInjectAnnotation || (hasRequiredArgsConstructor && isFinal)
+        ? 'field'
+        : 'other';
+
+    if (injectMode === 'other' && !isLikelyComponentType(type, imports)) {
+      match = regex.exec(javaText);
+      continue;
+    }
+    const key = `${name}::${type}`;
+    if (!dedupe.has(key)) {
+      dedupe.add(key);
+      result.push({ name, type, inject_mode: injectMode });
+    }
+    match = regex.exec(javaText);
+  }
+
+  for (const [name, type] of constructorInjections.entries()) {
+    const key = `${name}::${type}`;
+    if (dedupe.has(key)) {
+      continue;
+    }
+    dedupe.add(key);
+    result.push({ name, type, inject_mode: 'constructor' });
   }
   return result;
 }
 
-function normalizeServiceCalls(raw: unknown, injections: InjectionInfo[]): ServiceCallInfo[] {
-  if (!Array.isArray(raw)) {
-    return [];
+function findPrimaryClassBodyRange(javaText: string): { start: number; end: number } | undefined {
+  const classMatch = /\bclass\s+[A-Za-z0-9_]+\b[^{]*\{/m.exec(javaText);
+  if (!classMatch || classMatch.index === undefined) {
+    return undefined;
+  }
+  const openBraceOffset = classMatch[0].lastIndexOf('{');
+  if (openBraceOffset < 0) {
+    return undefined;
+  }
+  const start = classMatch.index + openBraceOffset;
+  const end = findMatchingPair(javaText, start, '{', '}');
+  if (end < 0) {
+    return undefined;
+  }
+  return { start, end };
+}
+
+// 关键逻辑: 仅在类顶层(depth=1)解析字段，避免把方法体里的局部变量误判为注入成员。
+function isTopLevelClassMemberPosition(
+  javaText: string,
+  index: number,
+  range: { start: number; end: number }
+): boolean {
+  if (index <= range.start || index >= range.end) {
+    return false;
+  }
+  let depth = 1;
+  let quote: '"' | "'" | '' = '';
+  let inLineComment = false;
+  let inBlockComment = false;
+  for (let i = range.start + 1; i < index; i += 1) {
+    const ch = javaText[i];
+    const next = javaText[i + 1] || '';
+
+    if (inLineComment) {
+      if (ch === '\n') {
+        inLineComment = false;
+      }
+      continue;
+    }
+    if (inBlockComment) {
+      if (ch === '*' && next === '/') {
+        inBlockComment = false;
+        i += 1;
+      }
+      continue;
+    }
+    if (!quote && ch === '/' && next === '/') {
+      inLineComment = true;
+      i += 1;
+      continue;
+    }
+    if (!quote && ch === '/' && next === '*') {
+      inBlockComment = true;
+      i += 1;
+      continue;
+    }
+    if ((ch === '"' || ch === "'") && javaText[i - 1] !== '\\') {
+      if (!quote) {
+        quote = ch as '"' | "'";
+      } else if (quote === ch) {
+        quote = '';
+      }
+      continue;
+    }
+    if (quote) {
+      continue;
+    }
+    if (ch === '{') {
+      depth += 1;
+      continue;
+    }
+    if (ch === '}') {
+      depth = Math.max(0, depth - 1);
+    }
+  }
+  return depth === 1;
+}
+
+function findFieldAnnotationBlock(javaText: string, lineStart: number): string {
+  const lines: string[] = [];
+  let cursor = lineStart;
+  while (cursor > 0) {
+    let prevLineEnd = cursor - 1;
+    if (prevLineEnd >= 0 && javaText[prevLineEnd] === '\n') {
+      prevLineEnd -= 1;
+    }
+    if (prevLineEnd < 0) {
+      break;
+    }
+    const prevLineStart = findLineStart(javaText, prevLineEnd);
+    if (prevLineStart >= cursor) {
+      break;
+    }
+    const prevLine = javaText.slice(prevLineStart, prevLineEnd + 1).trim();
+    if (!prevLine) {
+      cursor = prevLineStart;
+      continue;
+    }
+    if (prevLine.startsWith('@')) {
+      lines.unshift(prevLine);
+      cursor = prevLineStart;
+      continue;
+    }
+    break;
+  }
+  return lines.join('\n');
+}
+
+function parseConstructorInjectedFields(javaText: string): Map<string, string> {
+  const result = new Map<string, string>();
+  const className = parseClassName(javaText);
+  if (!className) {
+    return result;
   }
 
-  const injectionTypeByName = new Map<string, string>();
+  const ctorRegex = new RegExp(`\\b${escapeRegExp(className)}\\s*\\(`, 'g');
+  let ctorMatch = ctorRegex.exec(javaText);
+  while (ctorMatch) {
+    const openParenIndex = javaText.indexOf('(', ctorMatch.index);
+    if (openParenIndex < 0) {
+      ctorMatch = ctorRegex.exec(javaText);
+      continue;
+    }
+    const closeParenIndex = findMatchingPair(javaText, openParenIndex, '(', ')');
+    if (closeParenIndex < 0) {
+      ctorMatch = ctorRegex.exec(javaText);
+      continue;
+    }
+    let braceStart = closeParenIndex + 1;
+    while (braceStart < javaText.length && /\s/.test(javaText[braceStart])) {
+      braceStart += 1;
+    }
+    if (javaText[braceStart] !== '{') {
+      ctorMatch = ctorRegex.exec(javaText);
+      continue;
+    }
+    const braceEnd = findMatchingPair(javaText, braceStart, '{', '}');
+    if (braceEnd < 0) {
+      ctorMatch = ctorRegex.exec(javaText);
+      continue;
+    }
+
+    const paramsText = javaText.slice(openParenIndex + 1, closeParenIndex);
+    const ctorBody = javaText.slice(braceStart + 1, braceEnd);
+    const params = splitTopLevelComma(paramsText)
+      .map((item) => parseJavaParameter(item))
+      .filter((item): item is { type: string; name: string } => !!item);
+    for (const param of params) {
+      const assignmentRegex = new RegExp(
+        `\\bthis\\s*\\.\\s*([A-Za-z0-9_]+)\\s*=\\s*${escapeRegExp(param.name)}\\s*;`
+      );
+      const assignment = assignmentRegex.exec(ctorBody);
+      if (assignment?.[1]) {
+        result.set(assignment[1], param.type);
+      } else {
+        result.set(param.name, param.type);
+      }
+    }
+    ctorMatch = ctorRegex.exec(javaText);
+  }
+  return result;
+}
+
+function parseClassName(javaText: string): string {
+  const match = javaText.match(/\bclass\s+([A-Za-z0-9_]+)\b/);
+  return String(match?.[1] || '').trim();
+}
+
+function parseJavaParameter(param: string): { type: string; name: string } | undefined {
+  const cleaned = param
+    .replace(/@\w+(\s*\([^()]*\))?/g, ' ')
+    .replace(/\bfinal\b/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const match = cleaned.match(/(.+)\s+([A-Za-z0-9_]+)$/);
+  if (!match) {
+    return undefined;
+  }
+  return {
+    type: match[1].trim(),
+    name: match[2].trim()
+  };
+}
+
+function splitTopLevelComma(text: string): string[] {
+  const items: string[] = [];
+  let current = '';
+  let angleDepth = 0;
+  let parenDepth = 0;
+  let braceDepth = 0;
+  let bracketDepth = 0;
+  let quote: '"' | "'" | '' = '';
+  for (const ch of text) {
+    if ((ch === '"' || ch === "'") && (!quote || quote === ch)) {
+      quote = quote ? '' : (ch as '"' | "'");
+      current += ch;
+      continue;
+    }
+    if (quote) {
+      current += ch;
+      continue;
+    }
+    if (ch === '<') angleDepth += 1;
+    if (ch === '>') angleDepth = Math.max(0, angleDepth - 1);
+    if (ch === '(') parenDepth += 1;
+    if (ch === ')') parenDepth = Math.max(0, parenDepth - 1);
+    if (ch === '{') braceDepth += 1;
+    if (ch === '}') braceDepth = Math.max(0, braceDepth - 1);
+    if (ch === '[') bracketDepth += 1;
+    if (ch === ']') bracketDepth = Math.max(0, bracketDepth - 1);
+    if (ch === ',' && angleDepth === 0 && parenDepth === 0 && braceDepth === 0 && bracketDepth === 0) {
+      const part = current.trim();
+      if (part) {
+        items.push(part);
+      }
+      current = '';
+      continue;
+    }
+    current += ch;
+  }
+  const last = current.trim();
+  if (last) {
+    items.push(last);
+  }
+  return items;
+}
+
+function collectMemberCalls(methodSnippet: string): MemberCallInfo[] {
+  const regex = /\b([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(/g;
+  const calls: MemberCallInfo[] = [];
+  let match = regex.exec(methodSnippet);
+  while (match) {
+    const owner = String(match[1] || '').trim();
+    const method = String(match[2] || '').trim();
+    if (owner && method) {
+      calls.push({
+        owner,
+        method,
+        expression: `${owner}.${method}(...)`,
+        index: match.index
+      });
+    }
+    match = regex.exec(methodSnippet);
+  }
+  return calls;
+}
+
+function pickServiceCalls(
+  methodSnippet: string,
+  injections: InjectionInfo[],
+  imports: Record<string, string>
+): Array<{ call: MemberCallInfo; type: string }> {
+  const typeByVar = new Map<string, string>();
   for (const item of injections) {
-    injectionTypeByName.set(item.name, item.type);
+    typeByVar.set(item.name, item.type);
   }
-
-  const dedupe = new Set<string>();
-  const result: ServiceCallInfo[] = [];
-  for (const item of raw) {
-    if (!item || typeof item !== 'object') {
-      continue;
-    }
-    const data = item as Record<string, unknown>;
-    const serviceVar = String(data.service_var || '').trim();
-    const serviceMethod = String(data.service_method || '').trim();
-    const serviceType = String(data.service_type || injectionTypeByName.get(serviceVar) || '').trim();
-    if (!serviceVar || !serviceMethod || !serviceType) {
-      continue;
-    }
-    const key = `${serviceVar}::${serviceType}::${serviceMethod}`;
-    if (dedupe.has(key)) {
-      continue;
-    }
-    dedupe.add(key);
-    result.push({
-      service_var: serviceVar,
-      service_type: serviceType,
-      service_method: serviceMethod,
-      call_expression: String(data.call_expression || '').trim(),
-      reason: String(data.reason || '').trim()
-    });
-  }
-  return result;
+  const candidates = collectMemberCalls(methodSnippet)
+    .map((call) => ({ call, type: typeByVar.get(call.owner) || '' }))
+    .filter((item) => item.type && isLikelyServiceType(item.type, imports));
+  return candidates
+    .slice()
+    .sort((a, b) => scoreServiceCall(b.call, b.type, imports) - scoreServiceCall(a.call, a.type, imports));
 }
 
-function normalizeMapperCalls(raw: unknown): MapperCallInfo[] {
-  if (!Array.isArray(raw)) {
-    return [];
+function pickMapperCalls(
+  serviceMethodSnippet: string,
+  injections: InjectionInfo[],
+  imports: Record<string, string>
+): Array<{ call: MemberCallInfo; type: string }> {
+  const typeByVar = new Map<string, string>();
+  for (const item of injections) {
+    typeByVar.set(item.name, item.type);
   }
-  const dedupe = new Set<string>();
-  const result: MapperCallInfo[] = [];
-  for (const item of raw) {
-    if (!item || typeof item !== 'object') {
-      continue;
-    }
-    const data = item as Record<string, unknown>;
-    const mapperType = String(data.mapper_type || '').trim();
-    const mapperMethod = String(data.mapper_method || '').trim();
-    if (!mapperType) {
-      continue;
-    }
-    const key = `${mapperType}::${mapperMethod}`;
-    if (dedupe.has(key)) {
-      continue;
-    }
-    dedupe.add(key);
-    result.push({
-      mapper_type: mapperType,
-      mapper_method: mapperMethod,
-      reason: String(data.reason || '').trim()
-    });
-  }
-  return result;
+  const candidates = collectMemberCalls(serviceMethodSnippet)
+    .map((call) => ({ call, type: typeByVar.get(call.owner) || '' }))
+    .filter((item) => item.type && isLikelyMapperType(item.type, imports));
+  return candidates
+    .slice()
+    .sort((a, b) => scoreMapperCall(b.call, b.type, imports) - scoreMapperCall(a.call, a.type, imports));
 }
 
-function normalizeStringArray(raw: unknown): string[] {
-  if (!Array.isArray(raw)) {
-    return [];
+function scoreServiceCall(call: MemberCallInfo, typeName: string, imports: Record<string, string>): number {
+  const owner = call.owner.toLowerCase();
+  const method = call.method.toLowerCase();
+  let score = 0;
+  if (isLikelyServiceType(typeName, imports)) score += 100;
+  if (owner.includes('service') || owner.includes('biz') || owner.includes('manager')) score += 20;
+  if (/^(query|get|list|find|search|page|save|create|update|delete)/.test(method)) score += 10;
+  return score;
+}
+
+function scoreMapperCall(call: MemberCallInfo, typeName: string, imports: Record<string, string>): number {
+  const owner = call.owner.toLowerCase();
+  const method = call.method.toLowerCase();
+  let score = 0;
+  if (isLikelyMapperType(typeName, imports)) score += 100;
+  if (owner.includes('mapper') || owner.includes('dao') || owner.includes('repo')) score += 20;
+  if (/^(select|query|get|find|insert|save|update|delete)/.test(method)) score += 10;
+  return score;
+}
+
+function isLikelyComponentType(typeName: string, imports: Record<string, string>): boolean {
+  const simpleType = baseJavaTypeName(typeName);
+  const importPath = imports[simpleType] || '';
+  return /(service|mapper|dao|repository|manager|client|facade|gateway)/i.test(simpleType) ||
+    /\.(service|mapper|dao|repository|manager|client|facade|gateway)\./i.test(importPath);
+}
+
+function isLikelyServiceType(typeName: string, imports: Record<string, string>): boolean {
+  const simpleType = baseJavaTypeName(typeName);
+  const importPath = imports[simpleType] || '';
+  return /(service|biz|manager)/i.test(simpleType) || /\.(service|biz|manager)\./i.test(importPath);
+}
+
+function isLikelyMapperType(typeName: string, imports: Record<string, string>): boolean {
+  const simpleType = baseJavaTypeName(typeName);
+  const importPath = imports[simpleType] || '';
+  return /(mapper|dao|repository)/i.test(simpleType) || /\.(mapper|dao|repository)\./i.test(importPath);
+}
+
+async function resolveTypeFileByDefinition(
+  document: vscode.TextDocument,
+  offset: number,
+  expectedSimpleType: string
+): Promise<vscode.Uri | undefined> {
+  if (offset < 0) {
+    return undefined;
   }
-  const seen = new Set<string>();
-  const result: string[] = [];
-  for (const item of raw) {
-    const text = String(item || '').trim();
-    if (!text) {
+  const position = document.positionAt(offset);
+  const definitions =
+    (await vscode.commands.executeCommand<Array<vscode.Location | vscode.LocationLink>>(
+      'vscode.executeDefinitionProvider',
+      document.uri,
+      position
+    )) || [];
+  if (!Array.isArray(definitions) || definitions.length === 0) {
+    return undefined;
+  }
+
+  let best: { uri: vscode.Uri; score: number } | undefined;
+  for (const item of definitions) {
+    const uri = toDefinitionUri(item);
+    if (!uri || path.extname(uri.fsPath).toLowerCase() !== '.java') {
       continue;
     }
-    const key = text.toLowerCase();
-    if (seen.has(key)) {
-      continue;
+    const fileName = path.parse(uri.fsPath).name;
+    let score = 10;
+    if (expectedSimpleType) {
+      if (fileName === expectedSimpleType) {
+        score += 120;
+      } else if (fileName === `${expectedSimpleType}Impl`) {
+        score += 110;
+      } else if (fileName.startsWith(expectedSimpleType)) {
+        score += 80;
+      }
     }
-    seen.add(key);
-    result.push(text);
+    if (!best || score > best.score) {
+      best = { uri, score };
+    }
   }
-  return result;
+  return best?.uri;
 }
 
-function pickPrimaryServiceCall(items: ServiceCallInfo[]): ServiceCallInfo | undefined {
-  return items[0];
-}
-
-function pickPrimaryMapperCall(items: MapperCallInfo[]): MapperCallInfo | undefined {
-  return items[0];
-}
-
-function pickPrimaryString(items: string[]): string | undefined {
-  return items[0];
+function toDefinitionUri(item: vscode.Location | vscode.LocationLink): vscode.Uri | undefined {
+  const candidate = item as vscode.LocationLink;
+  if (candidate.targetUri) {
+    return candidate.targetUri;
+  }
+  return (item as vscode.Location).uri;
 }
 
 async function findJavaTypeFile(
@@ -577,9 +862,7 @@ async function findJavaTypeFile(
 
   if (preferredImport) {
     const expected = `${preferredImport.replace(/\./g, path.sep)}.java`;
-    const byImport = candidates.find((item) =>
-      normalizePath(item.fsPath).endsWith(normalizePath(expected))
-    );
+    const byImport = candidates.find((item) => normalizePath(item.fsPath).endsWith(normalizePath(expected)));
     if (byImport) {
       return byImport;
     }
@@ -627,109 +910,222 @@ async function findServiceImplFile(
   return undefined;
 }
 
+function extractSqlResourceNames(mapperText: string, mapperType: string): string[] {
+  const result: string[] = [];
+  const add = (value: string): void => {
+    const text = String(value || '').trim();
+    if (!text) {
+      return;
+    }
+    if (!result.find((item) => item.toLowerCase() === text.toLowerCase())) {
+      result.push(text);
+    }
+  };
+
+  const sqlResourceRegex = /@SqlResource\s*\(\s*["']([^"']+)["']\s*\)/gi;
+  let match = sqlResourceRegex.exec(mapperText);
+  while (match) {
+    add(match[1]);
+    match = sqlResourceRegex.exec(mapperText);
+  }
+
+  const resourceAttrRegex = /\bresource\s*=\s*["']([^"']+)["']/gi;
+  match = resourceAttrRegex.exec(mapperText);
+  while (match) {
+    add(match[1]);
+    match = resourceAttrRegex.exec(mapperText);
+  }
+
+  const mapperSimple = baseJavaTypeName(mapperType);
+  if (mapperSimple) {
+    add(mapperSimple);
+    add(mapperSimple.replace(/Mapper$/i, ''));
+  }
+  return result;
+}
+
+async function resolveSqlEvidence(
+  sqlResources: string[],
+  currentDir: string,
+  sqlSearchGlobs: string[],
+  mapperMethod: string
+): Promise<{ resource: string; file: vscode.Uri } | undefined> {
+  for (const resource of sqlResources) {
+    const file = await findSqlFileByResource(resource, currentDir, sqlSearchGlobs, mapperMethod);
+    if (file) {
+      return { resource, file };
+    }
+  }
+  return undefined;
+}
+
 async function findSqlFileByResource(
   resourceName: string,
-  currentDir: string
+  currentDir: string,
+  sqlSearchGlobs: string[],
+  mapperMethod: string
 ): Promise<vscode.Uri | undefined> {
   const safeName = resourceName.trim();
   if (!safeName) {
     return undefined;
   }
-
-  const directCandidates = await vscode.workspace.findFiles(
-    `**/${safeName}.md`,
-    EXCLUDE_GLOB,
-    200
-  );
-  if (directCandidates.length === 0) {
+  const sqlCandidates = await loadSqlCandidates(sqlSearchGlobs);
+  if (sqlCandidates.length === 0) {
     return undefined;
   }
-  if (directCandidates.length === 1) {
-    return directCandidates[0];
-  }
 
-  const preferred = directCandidates.find((item) =>
-    normalizePath(item.fsPath).includes('/src/main/resources/sql/')
-  );
-  if (preferred) {
-    return preferred;
-  }
+  const normalizedResource = normalizeResourceName(safeName);
+  const targetBase = path.posix.basename(normalizedResource);
+  // 关键逻辑: 先按路径规则粗排，再按内容命中（如 mapperMethod/id）精排。
+  const pathRanked = sqlCandidates
+    .map((uri) => ({
+      uri,
+      score: scoreSqlFileByPath(uri.fsPath, normalizedResource, targetBase, currentDir)
+    }))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 50);
 
-  return directCandidates
-    .slice()
-    .sort((a, b) => {
-      const aScore = commonPrefixLength(currentDir, path.dirname(a.fsPath).toLowerCase());
-      const bScore = commonPrefixLength(currentDir, path.dirname(b.fsPath).toLowerCase());
-      return bScore - aScore;
-    })[0];
-}
-
-function parseImports(javaText: string): Record<string, string> {
-  const imports: Record<string, string> = {};
-  const regex = /^\s*import\s+([a-zA-Z0-9_.]+)\s*;/gm;
-  let match: RegExpExecArray | null = regex.exec(javaText);
-  while (match) {
-    const full = match[1].trim();
-    const simple = full.split('.').at(-1);
-    if (simple) {
-      imports[simple] = full;
+  let best: { uri: vscode.Uri; score: number } | undefined;
+  for (const item of pathRanked) {
+    let score = item.score;
+    const sqlText = await readFileSafe(item.uri.fsPath);
+    if (sqlText && mapperMethod) {
+      const idRegex = new RegExp(`\\bid\\s*=\\s*["']${escapeRegExp(mapperMethod)}["']`, 'i');
+      if (idRegex.test(sqlText)) {
+        score += 200;
+      }
+      if (sqlText.includes(mapperMethod)) {
+        score += 80;
+      }
     }
-    match = regex.exec(javaText);
+    if (!best || score > best.score) {
+      best = { uri: item.uri, score };
+    }
   }
-  return imports;
+  return best?.uri;
 }
 
-function extractResponsesOutputText(result: Record<string, unknown>): string {
-  if (typeof result.output_text === 'string' && result.output_text.trim()) {
-    return result.output_text.trim();
+async function loadSqlCandidates(sqlSearchGlobs: string[]): Promise<vscode.Uri[]> {
+  const normalizedGlobs = normalizeSqlGlobs(sqlSearchGlobs);
+  const cacheKey = normalizedGlobs.join('||');
+  const cached = SQL_CANDIDATE_CACHE.get(cacheKey);
+  if (cached) {
+    return cached;
   }
-  if (!Array.isArray(result.output)) {
+
+  const groups = await Promise.all(
+    normalizedGlobs.map((glob) => vscode.workspace.findFiles(glob, EXCLUDE_GLOB, 500))
+  );
+  const dedupe = new Map<string, vscode.Uri>();
+  for (const group of groups) {
+    for (const uri of group) {
+      dedupe.set(normalizePath(uri.fsPath), uri);
+    }
+  }
+  const result = Array.from(dedupe.values());
+  SQL_CANDIDATE_CACHE.set(cacheKey, result);
+  return result;
+}
+
+function normalizeSqlGlobs(globs: string[]): string[] {
+  const source = Array.isArray(globs) && globs.length > 0 ? globs : DEFAULT_SQL_SEARCH_GLOBS;
+  return source.map((item) => String(item || '').trim()).filter((item) => item.length > 0);
+}
+
+function normalizeResourceName(resourceName: string): string {
+  const normalized = normalizePath(resourceName).replace(/\.(md|sql|xml)$/i, '');
+  return normalized.replace(/^\/+/, '');
+}
+
+function scoreSqlFileByPath(
+  filePath: string,
+  normalizedResource: string,
+  targetBase: string,
+  currentDir: string
+): number {
+  const normalizedFile = normalizePath(filePath);
+  const fileBase = path.parse(normalizedFile).name.toLowerCase();
+  const resourceBase = targetBase.toLowerCase();
+  let score = 0;
+  if (resourceBase && fileBase === resourceBase) {
+    score += 160;
+  } else if (resourceBase && fileBase.includes(resourceBase)) {
+    score += 100;
+  }
+  if (normalizedResource && normalizedFile.includes(normalizedResource)) {
+    score += 120;
+  }
+  if (normalizedFile.includes('/src/main/resources/')) {
+    score += 20;
+  }
+  score += Math.floor(commonPrefixLength(currentDir, path.dirname(filePath).toLowerCase()) / 4);
+  return score;
+}
+
+async function readFileSafe(filePath: string): Promise<string> {
+  try {
+    return await fs.readFile(filePath, 'utf8');
+  } catch {
     return '';
   }
-
-  const textParts: string[] = [];
-  for (const item of result.output) {
-    if (!item || typeof item !== 'object') {
-      continue;
-    }
-    const message = item as { type?: string; content?: Array<{ type?: string; text?: string }> };
-    if (message.type !== 'message' || !Array.isArray(message.content)) {
-      continue;
-    }
-    for (const part of message.content) {
-      if (!part || typeof part !== 'object') {
-        continue;
-      }
-      if ((part.type === 'output_text' || part.type === 'text') && typeof part.text === 'string') {
-        textParts.push(part.text);
-      }
-    }
-  }
-  return textParts.join('\n').trim();
 }
 
-function parseFirstJson(text: string): unknown | undefined {
-  if (!text) {
-    return undefined;
+function extractSqlByMethod(sqlText: string, mapperMethod: string, sqlFilePath: string): string {
+  if (!sqlText) {
+    return '';
   }
-  try {
-    return JSON.parse(text);
-  } catch {
-    // ignore
-  }
-
-  const objStart = text.indexOf('{');
-  const objEnd = text.lastIndexOf('}');
-  if (objStart !== -1 && objEnd !== -1 && objEnd > objStart) {
-    const candidate = text.slice(objStart, objEnd + 1);
-    try {
-      return JSON.parse(candidate);
-    } catch {
-      // ignore
+  const ext = path.extname(sqlFilePath).toLowerCase();
+  if (ext === '.xml') {
+    const xmlResult = extractMybatisSqlByMethod(sqlText, mapperMethod);
+    if (xmlResult) {
+      return xmlResult;
     }
   }
+  const beetlResult = extractBeetlSqlByMethod(sqlText, mapperMethod);
+  if (beetlResult) {
+    return beetlResult;
+  }
+  return trimText(sqlText, 3000);
+}
 
-  return undefined;
+function extractMybatisSqlByMethod(sqlText: string, mapperMethod: string): string {
+  const method = String(mapperMethod || '').trim();
+  if (!method) {
+    return '';
+  }
+  const statementRegex = new RegExp(
+    `<(select|insert|update|delete)\\b[^>]*\\bid\\s*=\\s*["']${escapeRegExp(method)}["'][^>]*>([\\s\\S]*?)<\\/\\1>`,
+    'i'
+  );
+  const match = statementRegex.exec(sqlText);
+  if (!match) {
+    return '';
+  }
+  return String(match[0] || '').trim();
+}
+
+function extractBeetlSqlByMethod(sqlText: string, mapperMethod: string): string {
+  const method = String(mapperMethod || '').trim();
+  if (!sqlText || !method) {
+    return '';
+  }
+  const sectionRegex = new RegExp(
+    `(^|\\r?\\n)\\s*${escapeRegExp(method)}\\s*\\r?\\n\\s*=+\\s*\\r?\\n([\\s\\S]*?)(?=\\r?\\n\\s*[^\\r\\n]+\\s*\\r?\\n\\s*=+\\s*\\r?\\n|$)`,
+    'i'
+  );
+  const sectionMatch = sectionRegex.exec(sqlText);
+  if (!sectionMatch) {
+    return '';
+  }
+  const sectionBody = String(sectionMatch[2] || '').trim();
+  if (!sectionBody) {
+    return '';
+  }
+  const codeFenceMatch = /```(?:sql)?\s*([\s\S]*?)```/i.exec(sectionBody);
+  if (codeFenceMatch && String(codeFenceMatch[1] || '').trim()) {
+    return String(codeFenceMatch[1]).trim();
+  }
+  return sectionBody;
 }
 
 function baseJavaTypeName(typeName: string): string {
@@ -762,34 +1158,6 @@ function trimText(text: string, maxLength: number): string {
   return `${text.slice(0, maxLength)}\n// ...内容过长，已截断`;
 }
 
-function extractBeetlSqlByMethod(sqlText: string, mapperMethod: string): string {
-  const method = String(mapperMethod || '').trim();
-  if (!sqlText || !method) {
-    return '';
-  }
-
-  const sectionRegex = new RegExp(
-    `(^|\\r?\\n)\\s*${escapeRegExp(method)}\\s*\\r?\\n\\s*=+\\s*\\r?\\n([\\s\\S]*?)(?=\\r?\\n\\s*[^\\r\\n]+\\s*\\r?\\n\\s*=+\\s*\\r?\\n|$)`,
-    'i'
-  );
-  const sectionMatch = sectionRegex.exec(sqlText);
-  if (!sectionMatch) {
-    return '';
-  }
-
-  const sectionBody = String(sectionMatch[2] || '').trim();
-  if (!sectionBody) {
-    return '';
-  }
-
-  const codeFenceMatch = /```(?:sql)?\s*([\s\S]*?)```/i.exec(sectionBody);
-  if (codeFenceMatch && String(codeFenceMatch[1] || '').trim()) {
-    return String(codeFenceMatch[1]).trim();
-  }
-
-  return sectionBody;
-}
-
-function escapeRegExp(value: string): string {
-  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
