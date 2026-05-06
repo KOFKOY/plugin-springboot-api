@@ -38,7 +38,7 @@ export async function prepareRequestPayload(
   if (needPagination) {
     log(
       'STEP',
-      `命中分页接口规则，将只在 JSON body 中补齐 pageNum=${PAGINATION_PAGE_NUM},pageSize=${PAGINATION_PAGE_SIZE}`
+      `命中分页接口规则，将只在 JSON body 中补齐 current=${PAGINATION_PAGE_NUM},pageSize=${PAGINATION_PAGE_SIZE}`
     );
   }
 
@@ -256,18 +256,18 @@ function isQueryByPageRequest(requestPath: string): boolean {
 function ensurePaginationFieldsOnPayload(payload: unknown): unknown {
   if (Array.isArray(payload)) {
     if (payload.length === 0) {
-      return [{ pageNum: PAGINATION_PAGE_NUM, pageSize: PAGINATION_PAGE_SIZE }];
+      return [{ current: PAGINATION_PAGE_NUM, pageSize: PAGINATION_PAGE_SIZE }];
     }
     const next = payload.slice();
     next[0] = ensurePaginationFieldsOnPayload(next[0]);
     return next;
   }
   if (!payload || typeof payload !== 'object') {
-    return { pageNum: PAGINATION_PAGE_NUM, pageSize: PAGINATION_PAGE_SIZE };
+    return { current: PAGINATION_PAGE_NUM, pageSize: PAGINATION_PAGE_SIZE };
   }
   const next = { ...(payload as Record<string, unknown>) };
-  if (next.pageNum === undefined) {
-    next.pageNum = PAGINATION_PAGE_NUM;
+  if (next.current === undefined) {
+    next.current = PAGINATION_PAGE_NUM;
   }
   if (next.pageSize === undefined) {
     next.pageSize = PAGINATION_PAGE_SIZE;
